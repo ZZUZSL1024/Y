@@ -3,10 +3,11 @@ import numpy as np
 import re
 from sentence_transformers import SentenceTransformer
 from typing import List
+from config import config
 
-DATA_PATH = "V1generated_user_cards.csv"
-PKL_PATH = "/root/autodl-tmp/Bixing_API/ai_search/V1_user_vec.pkl"
-EMBED_PATH = "/root/autodl-tmp/Bixing_API/ai_search/V1faiss_embeddings.npy"
+DATA_PATH = config["csv_path"]
+PKL_PATH = config["pkl_path"]
+EMBED_PATH = config["embed_path"]
 MAX_TEXT_LENGTH = 500
 MODEL_NAME = "BAAI/bge-base-zh"
 

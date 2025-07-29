@@ -1,9 +1,10 @@
 import pika
+from config import config
 
-RABBITMQ_HOST = "43.145.37.75"
-RABBITMQ_USER = "bixing"
-RABBITMQ_PASS = "Bixing@202505"
-QUEUE_NAME = "user.events.queue"
+RABBITMQ_HOST = config["rabbitmq_host"]
+RABBITMQ_USER = config["rabbitmq_user"]
+RABBITMQ_PASS = config["rabbitmq_pass"]
+QUEUE_NAME = config["queue_name"]
 
 credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
 connection = pika.BlockingConnection(

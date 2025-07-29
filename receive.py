@@ -6,14 +6,15 @@ import json
 import requests
 import hashlib
 import time
+from config import config
 
-RABBITMQ_HOST = "43.145.37.75"
-RABBITMQ_USER = "bixing"
-RABBITMQ_PASS = "Bixing@202505"
+RABBITMQ_HOST = config["rabbitmq_host"]
+RABBITMQ_USER = config["rabbitmq_user"]
+RABBITMQ_PASS = config["rabbitmq_pass"]
 # QUEUE_NAME = "Test MQ"
 ## user.modify.attr
 ## user.change.fragment
-QUEUE_NAME = "user.events.queue"
+QUEUE_NAME = config["queue_name"]
 
 processed_messages = {} 
 
@@ -29,10 +30,12 @@ def is_duplicate(msg_bytes):
     return False
 
 def fetch_user_data_from_api(user_id):
-    url = f"http://app.bixing.com.cn/v1/user/{user_id}/fetch-attrs"
+    base_url = config["api_base_url"]
+    token = config["api_token"]
+    url = f"{base_url}/v1/user/{user_id}/fetch-attrs"
     headers = {
         "Content-Type": "application/json",
-        "Cookie": "token=1b6a1051a3c645ea9bcbde36435fceef"
+        "Cookie": f"token={token}"
     }
     response = requests.post(url, headers=headers, json={})
     if response.status_code == 200:
@@ -87,13 +90,13 @@ def start_consume():
         pika.ConnectionParameters(RABBITMQ_HOST, 5672, credentials=credentials)
     )
     channel = connection.channel()
-    channel.queue_declare(queue='user.events.queue', durable=True)
+    channel.queue_declare(queue=QUEUE_NAME, durable=True)
     channel.queue_bind(exchange='user.behavior.events.exchange',
-                      queue='user.events.queue',
+                      queue=QUEUE_NAME,
                       routing_key='user.modify.attr')
     
     channel.queue_bind(exchange='user.behavior.events.exchange',
-                      queue='user.events.queue',
+                      queue=QUEUE_NAME,
                       routing_key='user.change.fragment')
 
     channel.basic_qos(prefetch_count=1)

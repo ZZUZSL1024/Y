@@ -2,11 +2,12 @@ import pika
 import json
 import os
 import argparse
+from config import config
 
-RABBITMQ_HOST = "43.145.37.75"
-RABBITMQ_USER = "bixing"
-RABBITMQ_PASS = "Bixing@202505"
-QUEUE_NAME = "Test MQ"
+RABBITMQ_HOST = config["rabbitmq_host"]
+RABBITMQ_USER = config["rabbitmq_user"]
+RABBITMQ_PASS = config["rabbitmq_pass"]
+QUEUE_NAME = config["queue_name"]
 
 def send_user_data(json_path):
     with open(json_path, "r", encoding="utf-8") as f:

@@ -10,6 +10,7 @@ from glob import glob
 import openai
 from tqdm import tqdm  # 新增
 import time
+from config import config
 # import ZhiPUAI
 # # OpenAI 初始化
 # client = openai.OpenAI(
@@ -18,7 +19,7 @@ import time
 
 processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
 blip_model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-opt-2.7b").to("cuda")
-CSV_PATH = "V1generated_user_cards.csv"
+CSV_PATH = config["csv_path"]
 
 def init_csv():
     if not os.path.exists(CSV_PATH):
@@ -99,8 +100,8 @@ traits, writing_style, emotional_patterns, default_needs, attachment_style, prof
 """
 
     # 智谱GLM-4的API参数
-    glm_api_key = "dfc68f67202b4cd393696875e674f576.6l5EvXiEsOzyRhuN"
-    glm_api_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    glm_api_key = config["glm_api_key"]
+    glm_api_url = config["glm_api_url"]
 
     headers = {
         "Authorization": f"Bearer {glm_api_key}",
