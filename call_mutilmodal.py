@@ -11,14 +11,17 @@ import openai
 from tqdm import tqdm  # 新增
 import time
 from config import config
+
+MODEL_DIR = config.get("model_dir", "/root/autodl-fs")
 # import ZhiPUAI
 # # OpenAI 初始化
 # client = openai.OpenAI(
 #     api_key="sk-MnAWpDIEPZid_w-oeZVjZLLw-XehhhPCSwumOVKu2WT3BlbkFJsgTLbZWkYi3akrNnamWh96rOclJofmj8oXi9k3MagA"
 # )
 
-processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
-blip_model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-opt-2.7b").to("cuda")
+blip_path = os.path.join(MODEL_DIR, "Salesforce", "blip2-opt-2.7b")
+processor = Blip2Processor.from_pretrained(blip_path)
+blip_model = Blip2ForConditionalGeneration.from_pretrained(blip_path).to("cuda")
 CSV_PATH = config["csv_path"]
 
 def init_csv():

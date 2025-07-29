@@ -9,5 +9,6 @@
   "api_token": "1b6a1051a3c645ea9bcbde36435fceef",
   "csv_path": "V1generated_user_cards.csv",
   "pkl_path": "/root/autodl-tmp/Bixing_API/ai_search/V1_user_vec.pkl",
-  "embed_path": "/root/autodl-tmp/Bixing_API/ai_search/V1faiss_embeddings.npy"
+  "embed_path": "/root/autodl-tmp/Bixing_API/ai_search/V1faiss_embeddings.npy",
+  "model_dir": "/root/autodl-fs"
 }

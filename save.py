@@ -5,16 +5,18 @@ from sentence_transformers import SentenceTransformer
 from typing import List
 from config import config
 
+MODEL_DIR = config.get("model_dir", "/root/autodl-fs")
+
 DATA_PATH = config["csv_path"]
 PKL_PATH = config["pkl_path"]
 EMBED_PATH = config["embed_path"]
 MAX_TEXT_LENGTH = 500
-MODEL_NAME = "BAAI/bge-base-zh"
+MODEL_NAME = os.path.join(MODEL_DIR, "BAAI", "bge-base-zh-v1.5")
 
 def generate_embeddings_from_csv():
     print("🚀 载入模型中...")
     # embed_model = SentenceTransformer("BAAI/bge-base-zh", device="cuda")
-    embed_model = SentenceTransformer("BAAI/bge-base-zh-v1.5", device="cuda")
+    embed_model = SentenceTransformer(MODEL_NAME, device="cuda")
 
     print("📄 读取 CSV 数据...")
     df = pd.read_csv(DATA_PATH)
