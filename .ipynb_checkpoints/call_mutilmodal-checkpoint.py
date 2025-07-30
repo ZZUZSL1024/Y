@@ -10,15 +10,11 @@ from glob import glob
 import openai
 from tqdm import tqdm  # 新增
 import time
-# import ZhiPUAI
-# # OpenAI 初始化
-# client = openai.OpenAI(
-#     api_key="sk-MnAWpDIEPZid_w-oeZVjZLLw-XehhhPCSwumOVKu2WT3BlbkFJsgTLbZWkYi3akrNnamWh96rOclJofmj8oXi9k3MagA"
-# )
+from config import config
 
 processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
 blip_model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-opt-2.7b").to("cuda")
-CSV_PATH = "generated_user_cards.csv"
+CSV_PATH = config["csv_path"]
 
 def init_csv():
     if not os.path.exists(CSV_PATH):
@@ -95,8 +91,8 @@ one_sentence_summary: 用“一个xxx的xxx”格式极简总结用户,输出不
 """
 
     # 智谱GLM-4的API参数
-    glm_api_key = "17ca504641dc453abd226f68dc4406cd.b630HB2L0SCamtqA"
-    glm_api_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    glm_api_key = config["glm_api_key"]
+    glm_api_url = config["glm_api_url"]
 
     headers = {
         "Authorization": f"Bearer {glm_api_key}",

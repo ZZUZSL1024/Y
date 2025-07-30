@@ -4,20 +4,20 @@ from call_mutilmodal import multimodal_analyze_and_save
 from save import generate_embeddings_from_csv
 import json
 import requests
+from config import config
 
-RABBITMQ_HOST = "43.145.37.75"
-RABBITMQ_USER = "bixing"
-RABBITMQ_PASS = "Bixing@202505"
-# QUEUE_NAME = "Test MQ"
-## user.modify.attr
-## user.change.fragment
-QUEUE_NAME = "user.events.queue"
+RABBITMQ_HOST = config["rabbitmq_host"]
+RABBITMQ_USER = config["rabbitmq_user"]
+RABBITMQ_PASS = config["rabbitmq_pass"]
+QUEUE_NAME = config["queue_name"]
 
 def fetch_user_data_from_api(user_id):
-    url = f"http://app.bixing.com.cn/v1/user/{user_id}/fetch-attrs"
+    base_url = config["api_base_url"]
+    token = config["api_token"]
+    url = f"{base_url}/v1/user/{user_id}/fetch-attrs"
     headers = {
         "Content-Type": "application/json",
-        "Cookie": "token=1b6a1051a3c645ea9bcbde36435fceef"
+        "Cookie": f"token={token}"
     }
     response = requests.post(url, headers=headers, json={})
     if response.status_code == 200:
