@@ -1,7 +1,13 @@
-import json
 import os
+import tomllib
 
-CONFIG_PATH = os.environ.get("CONFIG_PATH", os.path.join(os.path.dirname(__file__), "config.json"))
+# Default to config.toml in the current directory unless CONFIG_PATH is provided
+CONFIG_PATH = os.environ.get(
+    "CONFIG_PATH", os.path.join(os.path.dirname(__file__), "config.toml")
+)
 
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    config = json.load(f)
+with open(CONFIG_PATH, "rb") as f:
+    config = tomllib.load(f)
+
+# API key is retrieved from the environment for security
+config["glm_api_key"] = os.environ.get("GLM_API_KEY", "")
