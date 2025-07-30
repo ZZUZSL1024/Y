@@ -10,14 +10,22 @@ from glob import glob
 import openai
 from tqdm import tqdm  # 新增
 import time
+import tomllib
 # import ZhiPUAI
 # # OpenAI 初始化
 # client = openai.OpenAI(
 #     api_key="sk-MnAWpDIEPZid_w-oeZVjZLLw-XehhhPCSwumOVKu2WT3BlbkFJsgTLbZWkYi3akrNnamWh96rOclJofmj8oXi9k3MagA"
 # )
 
-processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
-blip_model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-opt-2.7b").to("cuda")
+with open("config.toml", "rb") as f:
+    CONFIG = tomllib.load(f)
+
+MODEL_BASE = CONFIG["model"]["base_dir"]
+BLIP_MODEL_PATH = os.path.join(MODEL_BASE, CONFIG["model"]["blip2"])
+GLM_URL = CONFIG["api"]["glm_url"]
+
+processor = Blip2Processor.from_pretrained(BLIP_MODEL_PATH)
+blip_model = Blip2ForConditionalGeneration.from_pretrained(BLIP_MODEL_PATH).to("cuda")
 CSV_PATH = "V1generated_user_cards.csv"
 
 def init_csv():
@@ -99,8 +107,10 @@ traits, writing_style, emotional_patterns, default_needs, attachment_style, prof
 """
 
     # 智谱GLM-4的API参数
-    glm_api_key = "dfc68f67202b4cd393696875e674f576.6l5EvXiEsOzyRhuN"
-    glm_api_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    glm_api_key = os.getenv("GLM_API_KEY")
+    glm_api_url = GLM_URL
+    if not glm_api_key:
+        raise RuntimeError("GLM_API_KEY environment variable not set")
 
     headers = {
         "Authorization": f"Bearer {glm_api_key}",

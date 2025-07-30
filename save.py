@@ -1,8 +1,10 @@
+import os
 import pandas as pd
 import numpy as np
 import re
 from sentence_transformers import SentenceTransformer
 from typing import List
+import tomllib
 
 DATA_PATH = "V1generated_user_cards.csv"
 PKL_PATH = "/root/autodl-tmp/Bixing_API/ai_search/V1_user_vec.pkl"
@@ -12,8 +14,11 @@ MODEL_NAME = "BAAI/bge-base-zh"
 
 def generate_embeddings_from_csv():
     print("🚀 载入模型中...")
-    # embed_model = SentenceTransformer("BAAI/bge-base-zh", device="cuda")
-    embed_model = SentenceTransformer("BAAI/bge-base-zh-v1.5", device="cuda")
+    with open("config.toml", "rb") as f:
+        cfg = tomllib.load(f)
+    base = cfg["model"]["base_dir"]
+    embed_path = os.path.join(base, cfg["model"]["embed"])
+    embed_model = SentenceTransformer(embed_path, device="cuda")
 
     print("📄 读取 CSV 数据...")
     df = pd.read_csv(DATA_PATH)

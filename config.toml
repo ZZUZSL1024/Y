@@ -1,0 +1,7 @@
+[model]
+base_dir = "/root/autodl-fs"
+blip2 = "Salesforce/blip2-opt-2.7b"
+embed = "BAAI/bge-base-zh-v1.5"
+
+[api]
+glm_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
