@@ -155,6 +155,35 @@ def _compose_caption_from_features(features: Optional[Dict]) -> Optional[str]:
         return tag_text.replace(" 标签：", "标签：")
     return None
 
+def _captions_from_payload(user_data: dict) -> List[str]:
+    """
+    从 API 载荷中读取多模态描述列表：
+    期望 user_data["multimodal_features_list"] 是一个列表，元素可为：
+      - 字符串：直接当作描述
+      - 字典：包含 description/tags 字段，复用 _compose_caption_from_features() 产出描述
+    """
+    if not isinstance(user_data, dict):
+        return []
+    lst = (
+        user_data.get("multimodal_features_list")
+        or user_data.get("multimodalFeaturesList")  # 兼容大小写/驼峰
+        or []
+    )
+    if not isinstance(lst, list):
+        log.warning("multimodal_features_list 非列表，已忽略；type=%s", type(lst).__name__)
+        return []
+
+    captions: List[str] = []
+    for item in lst:
+        cap = None
+        if isinstance(item, str):
+            cap = item.strip()
+        elif isinstance(item, dict):
+            cap = _compose_caption_from_features(item)
+        if cap:
+            captions.append(cap)
+    return captions
+
 
 def _build_fragment_query(user_id: str) -> Dict:
     fields = []
@@ -298,7 +327,7 @@ traits, writing_style, emotional_patterns, default_needs, attachment_style, prof
 
 
 def multimodal_analyze_and_save(user_data: dict) -> bool:
-    """主流程：读取预处理结果 -> 调 GLM -> 写入 ES。"""
+    """主流程：直接从 API 载荷读取多模态描述 -> 调 GLM -> 写入 ES。"""
     if not isinstance(user_data, dict):
         log.error("multimodal: 入参 user_data 非 dict，跳过")
         return False
@@ -316,13 +345,7 @@ def multimodal_analyze_and_save(user_data: dict) -> bool:
     nick_name = user.get("nickName", "") or ""
     log.info("开始处理用户 userId=%s nick=%s", user_id, nick_name)
 
-    try:
-        es = get_client()
-    except Exception as exc:
-        log.exception("ES 客户端初始化失败: %s", exc)
-        return False
-
-    # —— 文本抽取
+    # ① 文本抽取（不依赖 ES）
     t0 = time.time()
     try:
         texts = extract_text({"user": user})
@@ -331,19 +354,14 @@ def multimodal_analyze_and_save(user_data: dict) -> bool:
         texts = ""
     t_text = (time.time() - t0) * 1000
 
-    # —— 获取预处理的图片描述
+    # ② 直接从 API 载荷拿多模态描述（不再从 ES 查询）
     t1 = time.time()
-    raw_captions = fetch_user_fragment_descriptions(es, user_id, MAX_CAPTION_IMAGES)
+    raw_captions = _captions_from_payload(user_data)
     captions = _normalize_captions(raw_captions)
     t_caption = (time.time() - t1) * 1000
-    log.info(
-        "从预处理服务获取到 %d/%d 条图片描述 userId=%s",
-        len(raw_captions),
-        len(captions),
-        user_id,
-    )
+    log.info("从 API 载荷获取到 %d/%d 条图片描述 userId=%s", len(raw_captions), len(captions), user_id)
 
-    # —— 调 GLM
+    # ③ 调 GLM 生成画像
     t2 = time.time()
     card = call_glm4(user_id, texts, captions) or {}
     t_glm = (time.time() - t2) * 1000
@@ -360,6 +378,7 @@ def multimodal_analyze_and_save(user_data: dict) -> bool:
         "one_sentence_summary": _as_text(card.get("one_sentence_summary", "")),
     }
 
+    # ④ 组装向量
     embed_text = (
         f"角色名：{result_row['name']} "
         f"简介：{result_row['profile_text']} "
@@ -371,7 +390,6 @@ def multimodal_analyze_and_save(user_data: dict) -> bool:
         f"推荐语：{result_row['one_sentence_summary']}"
     )
 
-    # —— 向量
     t3 = time.time()
     try:
         embedding = EMBED_MODEL.encode(embed_text, normalize_embeddings=True).tolist()
@@ -397,9 +415,10 @@ def multimodal_analyze_and_save(user_data: dict) -> bool:
         **result_row,
     }
 
-    # —— 写 ES
+    # ⑤ 写 ES（用户画像索引仍保留）
     t4 = time.time()
     try:
+        es = get_client()
         ensure_user_profile_index()
         es.index(
             index=get_user_profile_index(),
@@ -409,16 +428,11 @@ def multimodal_analyze_and_save(user_data: dict) -> bool:
         t_es = (time.time() - t4) * 1000
         total = t_text + t_caption + t_glm + t_embed + t_es
         log.info(
-            "用户 %s 处理完成并写入 ES | text=%.1fms caption=%.1fms glm=%.1fms embed=%.1fms es=%.1fms total=%.1fms",
-            user_id,
-            t_text,
-            t_caption,
-            t_glm,
-            t_embed,
-            t_es,
-            total,
+            "用户 %s 处理完成并写入 ES | text=%.1fms captions=%.1fms glm=%.1fms embed=%.1fms es=%.1fms total=%.1fms",
+            user_id, t_text, t_caption, t_glm, t_embed, t_es, total,
         )
         return True
     except Exception as exc:
         log.exception("写入 ES 失败 userId=%s err=%s", user_id, exc)
         return False
+
