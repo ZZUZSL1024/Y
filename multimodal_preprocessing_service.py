@@ -38,8 +38,16 @@ RABBITMQ_PASS = config["rabbitmq_pass"]
 FRAGMENT_QUEUE_NAME = config.get("fragment_queue_name", "fragment.preprocessing.queue")
 FRAGMENT_ROUTING_KEY = config.get("fragment_routing_key", "user.change.fragment")
 FRAGMENT_EXCHANGE = config.get("fragment_exchange", "user.behavior.events.exchange")
-FRAGMENT_RESULT_EXCHANGE = config.get("fragment_result_exchange", "fragment.preprocessing.exchange")
-FRAGMENT_RESULT_ROUTING_KEY = config.get("fragment_result_routing_key", "fragment.preprocessed")
+FRAGMENT_RESULT_EXCHANGE = config.get(
+    "fragment_result_exchange", "ai.processing.results.exchange"
+)
+FRAGMENT_RESULT_ROUTING_KEY = config.get(
+    "fragment_result_routing_key", "fragment.preprocessing.completed"
+)
+
+RESULT_STATUS_SUCCESS = "success"
+RESULT_STATUS_FAILURE = "failure"
+DEFAULT_ERROR_CODE = "PROCESSING_ERROR"
 
 FRAGMENT_ID_FIELD = str(config.get("fragment_id_field", "fragmentId")).strip() or "fragmentId"
 FRAGMENT_USER_FIELD = str(config.get("fragment_user_field", "userId")).strip() or "userId"
@@ -142,6 +150,19 @@ class MultimodalPreprocessingService:
                 media_type = value.strip().lower()
                 break
 
+        trace_id = str(
+            payload.get("trace_id")
+            or payload.get("traceId")
+            or data.get("trace_id")
+            or data.get("traceId")
+            or ""
+        ).strip()
+
+        request_metadata: Dict[str, Any] = {}
+        for candidate in (payload.get("metadata"), data.get("metadata")):
+            if isinstance(candidate, dict):
+                request_metadata.update(candidate)
+
         if not media_url:
             return None
 
@@ -150,6 +171,8 @@ class MultimodalPreprocessingService:
             "user_id": user_id,
             "media_url": media_url,
             "media_type": media_type or "picture",
+            "trace_id": trace_id,
+            "metadata": request_metadata,
         }
 
     def _build_messages(self, media_url: str, media_type: str) -> List[Dict[str, Any]]:
@@ -200,29 +223,72 @@ class MultimodalPreprocessingService:
             "raw_response": data,
         }
 
+    def _build_result_message(
+        self,
+        *,
+        trace_id: str,
+        metadata: Optional[Dict[str, Any]],
+        fragment_id: str,
+        user_id: str,
+        media_url: str,
+        media_type: str,
+        features: Optional[Dict[str, Any]],
+        error: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        result_metadata: Dict[str, Any] = dict(metadata or {})
+        if fragment_id:
+            result_metadata.setdefault("fragment_id", fragment_id)
+        if user_id:
+            result_metadata.setdefault("user_id", user_id)
+        if media_url:
+            result_metadata.setdefault("media_url", media_url)
+        if media_type:
+            result_metadata.setdefault("media_type", media_type)
+
+        status = RESULT_STATUS_SUCCESS if features else RESULT_STATUS_FAILURE
+        error_payload = None
+        if status == RESULT_STATUS_FAILURE:
+            error_payload = {
+                "code": str((error or {}).get("code") or DEFAULT_ERROR_CODE),
+                "message": str((error or {}).get("message") or "多模态预处理失败"),
+            }
+
+        return {
+            "status": status,
+            "trace_id": str(trace_id or ""),
+            "metadata": result_metadata,
+            "payload": features if features else None,
+            "error": error_payload,
+        }
+
     def _publish(self, channel: pika.channel.Channel, message: Dict[str, Any]) -> bool:
+        fragment_id = (message.get("metadata") or {}).get("fragment_id")
+        trace_id = message.get("trace_id")
         if not FRAGMENT_RESULT_EXCHANGE or not FRAGMENT_RESULT_ROUTING_KEY:
             log.error(
-                "未配置 fragment_result_exchange 或 routing_key，无法回传预处理结果 fragmentId=%s",
-                message.get("fragmentId"),
+                "未配置 fragment_result_exchange 或 routing_key，无法回传预处理结果 fragmentId=%s traceId=%s",
+                fragment_id,
+                trace_id,
             )
             return False
         try:
             channel.basic_publish(
                 exchange=FRAGMENT_RESULT_EXCHANGE,
                 routing_key=FRAGMENT_RESULT_ROUTING_KEY,
-                body=json.dumps(message, ensure_ascii=False).encode("utf-8"),
+                body=json.dumps(message, ensure_ascii=False, default=str).encode("utf-8"),
                 properties=pika.BasicProperties(delivery_mode=2),
             )
             log.info(
-                "已推送预处理结果 fragmentId=%s exchange=%s rk=%s",
-                message.get("fragmentId"),
+                "已推送预处理结果 status=%s traceId=%s fragmentId=%s exchange=%s rk=%s",
+                message.get("status"),
+                trace_id,
+                fragment_id,
                 FRAGMENT_RESULT_EXCHANGE,
                 FRAGMENT_RESULT_ROUTING_KEY,
             )
             return True
         except Exception as exc:
-            log.exception("推送预处理结果失败 fragmentId=%s err=%s", message.get("fragmentId"), exc)
+            log.exception("推送预处理结果失败 fragmentId=%s err=%s", fragment_id, exc)
             return False
 
     # ------------------------------------------------------------------
@@ -251,17 +317,38 @@ class MultimodalPreprocessingService:
             media_type = info["media_type"]
             user_id = info["user_id"]
 
-            features = self._call_glm(fragment_id, media_url, media_type)
-            if not features:
+            features: Optional[Dict[str, Any]] = None
+            error_info: Optional[Dict[str, Any]] = None
+            try:
+                features = self._call_glm(fragment_id, media_url, media_type)
+                if not features:
+                    error_info = {
+                        "code": "NO_FEATURES",
+                        "message": "GLM 未返回有效的多模态特征",
+                    }
+            except Exception as exc:  # noqa: BLE001
+                log.exception("处理碎片失败 fragmentId=%s err=%s", fragment_id, exc)
+                error_info = {
+                    "code": "UNEXPECTED_EXCEPTION",
+                    "message": str(exc),
+                }
+                features = None
+
+            result_message = self._build_result_message(
+                trace_id=info.get("trace_id", ""),
+                metadata=info.get("metadata"),
+                fragment_id=fragment_id,
+                user_id=user_id,
+                media_url=media_url,
+                media_type=media_type,
+                features=features,
+                error=error_info,
+            )
+
+            if result_message.get("status") != RESULT_STATUS_SUCCESS:
                 success = False
-                continue
-            publish_payload = {
-                "fragmentId": fragment_id,
-                "userId": user_id,
-                "mediaUrl": media_url,
-                "multimodal_features": features,
-            }
-            published = self._publish(channel, publish_payload)
+
+            published = self._publish(channel, result_message)
             if not published:
                 success = False
 
