@@ -27,3 +27,36 @@ config["api_base_url"] = os.environ.get(
 config["queue_name"] = os.environ.get(
     "QUEUE_NAME", config.get("queue_name", "")
 )
+config["fragment_queue_name"] = os.environ.get(
+    "FRAGMENT_QUEUE_NAME", config.get("fragment_queue_name", "")
+)
+config["fragment_exchange"] = os.environ.get(
+    "FRAGMENT_EXCHANGE", config.get("fragment_exchange", "")
+)
+config["fragment_routing_key"] = os.environ.get(
+    "FRAGMENT_ROUTING_KEY", config.get("fragment_routing_key", "")
+)
+config["fragment_result_exchange"] = os.environ.get(
+    "FRAGMENT_RESULT_EXCHANGE", config.get("fragment_result_exchange", "")
+)
+config["fragment_result_routing_key"] = os.environ.get(
+    "FRAGMENT_RESULT_ROUTING_KEY", config.get("fragment_result_routing_key", "")
+)
+config["fragment_index"] = os.environ.get(
+    "FRAGMENT_INDEX", config.get("fragment_index", "")
+)
+config["fragment_user_field"] = os.environ.get(
+    "FRAGMENT_USER_FIELD", config.get("fragment_user_field", "")
+)
+config["fragment_multimodal_field"] = os.environ.get(
+    "FRAGMENT_MULTIMODAL_FIELD", config.get("fragment_multimodal_field", "")
+)
+config["fragment_id_field"] = os.environ.get(
+    "FRAGMENT_ID_FIELD", config.get("fragment_id_field", "")
+)
+config["multimodal_glm_model"] = os.environ.get(
+    "MULTIMODAL_GLM_MODEL", config.get("multimodal_glm_model", "")
+)
+config["multimodal_glm_timeout"] = os.environ.get(
+    "MULTIMODAL_GLM_TIMEOUT", config.get("multimodal_glm_timeout", "")
+)
