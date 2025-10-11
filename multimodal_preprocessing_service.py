@@ -3,14 +3,18 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import re
 import socket
+import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import pika
 
@@ -62,33 +66,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("fragment-preprocessor")
 
-# ---------------------------------------------------------------------------
-# 工具函数
-# ---------------------------------------------------------------------------
-
-def conn_name(role: str) -> str:
-    return f"{PROJECT_NAME}-{role}@{CLIENT_INFO}-{os.getpid()}"
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _ensure_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        return [str(item).strip() for item in value if str(item).strip()]
-    text = str(value).strip()
-    if not text:
-        return []
-    if any(sep in text for sep in [",", "、", "|"]):
-        return [part.strip() for part in re.split(r"[,、|]", text) if part.strip()]
-    return [text]
-
-
-PROMPT_TEXT = (
-"""
+# ====== 新增：两套提示词 ======
+PROMPT_IMAGE = r"""
 你是一个专业的图像分析引擎，任务是像法证调查员一样，客观、详尽、不带任何主观推断地描述眼前这幅图像。你的描述将被后续的文本分析模型使用，因此必须包含尽可能丰富的视觉细节。
 
 请严格按照以下JSON格式返回你的分析结果，确保输出是一个完整的、格式正确的JSON对象，只包含 "description" 和 "tags" 两个键。
@@ -103,8 +82,105 @@ PROMPT_TEXT = (
     "（根据图片中可直接观察到的客观元素，生成一个关键词列表。标签应为名词或动名词，例如：'笔记本电脑', '咖啡馆', '人物侧影', '城市夜景', '拉布拉多犬', '海边日落', '徒步旅行'）"
   ]
 }
-"""
-)
+""".strip()
+
+PROMPT_VIDEO = r"""
+你是一个专业的视频画面分析引擎。现在将收到按时间顺序抽取的**多张关键帧**（仅视觉，无音频与真实时间戳）。请**综合所有帧**进行客观描述，避免编造时间、音频、因果或主观动机。
+请严格按以下 JSON 返回，且只包含 "description" 和 "tags" 两个键。
+
+{
+  "description": "请按结构化方式书写：A) 全局概括（视频主要场景与主题）；B) 时间序列要点（按帧出现顺序概括画面变化与动作推进，可用“帧1…帧N”的方式）；C) 场景/镜头变化（地点/光线/构图显著变化）；D) 核心主体与交互（谁在做什么、物体如何被操作——仅基于可见画面）；E) 视觉风格（色调、光线、运动模糊/景深等）；F) 结尾画面状态（最后一帧可见结果）。全程保持客观与克制。",
+  "tags": [
+    "稳定元素与关键动作的名词/动名词标签，如：'室内办公','会议桌','投影屏幕','人群走动','车辆驶过','海边黄昏','镜头切换','特写','俯拍','低照度'"
+  ]
+}
+""".strip()
+
+# ---------------------------------------------------------------------------
+# 可调视频抽帧参数（本地抽帧 -> 多图送入 GLM）
+# ---------------------------------------------------------------------------
+VIDEO_FRAME_COUNT = int(config.get("video_frame_count", 5))             # 最大抽帧数
+VIDEO_MAX_PIXELS = int(config.get("video_max_pixels", 1280 * 720))      # 每帧最大像素（约 720p）
+VIDEO_EXTS = set((config.get("video_exts") or ".mp4,.mov,.m4v,.webm,.avi,.mkv").lower().split(","))
+MAX_TOTAL_IMAGE_BYTES = int(config.get("video_max_total_image_bytes", 6 * 1024 * 1024))  # 所有帧图总字节上限（base64前原始文件大小估算）
+
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
+
+def conn_name(role: str) -> str:
+    return f"{PROJECT_NAME}-{role}@{CLIENT_INFO}-{os.getpid()}"
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+def _ensure_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    if any(sep in text for sep in [",", "、", "|"]):
+        return [part.strip() for part in re.split(r"[,、|]", text) if part.strip()]
+    return [text]
+
+def _is_probably_video(media_type: Optional[str], media_url: str) -> bool:
+    if media_type and "video" in media_type.lower():
+        return True
+    try:
+        ext = (os.path.splitext(urlparse(media_url).path)[1] or "").lower()
+        return ext in VIDEO_EXTS
+    except Exception:
+        return False
+
+def _has_ffmpeg() -> bool:
+    try:
+        subprocess.run(["ffmpeg", "-version"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+def _sample_video_frames_to_files(media_url: str, num_frames: int = VIDEO_FRAME_COUNT) -> List[str]:
+    """
+    使用 ffmpeg 从远程视频均匀抽取若干帧到临时目录，返回帧图文件列表。
+    策略：使用 fps=1 降采样并限制分辨率，随后截取前 num_frames 张。
+    """
+    if not _has_ffmpeg():
+        return []
+
+    tmpdir = tempfile.mkdtemp(prefix="vidframes_")
+    out_pattern = os.path.join(tmpdir, "frame_%03d.jpg")
+
+    # 缩放到不超过 VIDEO_MAX_PIXELS 的分辨率，并以 1 fps 抽帧
+    vf = (
+        f"scale='if(gt(iw*ih,{VIDEO_MAX_PIXELS}),iw*sqrt({VIDEO_MAX_PIXELS}/(iw*ih)),iw)':"
+        f"'if(gt(iw*ih,{VIDEO_MAX_PIXELS}),ih*sqrt({VIDEO_MAX_PIXELS}/(iw*ih)),ih)',fps=1"
+    )
+    cmd = ["ffmpeg", "-y", "-i", media_url, "-vf", vf, "-vsync", "vfr", out_pattern]
+
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+    except Exception as e:
+        log.warning("ffmpeg 抽帧失败：%s", e)
+        return []
+
+    frames = sorted(
+        [os.path.join(tmpdir, f) for f in os.listdir(tmpdir) if f.lower().endswith(".jpg")]
+    )
+    if not frames:
+        return []
+
+    return frames[: max(1, num_frames)]
+
+def _file_to_data_url(fp: str) -> str:
+    with open(fp, "rb") as f:
+        raw = f.read()
+    b64 = base64.b64encode(raw).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}", len(raw)
+
+
 
 MEDIA_URL_FIELDS = ["mediaUrl", "sourceUrl", "url", "coverUrl", "thumbnailUrl"]
 MEDIA_TYPE_FIELDS = ["mediaType", "type", "fragmentType", "category"]
@@ -188,18 +264,38 @@ class MultimodalPreprocessingService:
         }
 
     def _build_messages(self, media_url: str, media_type: str) -> List[Dict[str, Any]]:
-        description = PROMPT_TEXT
-        if media_type and "video" in media_type:
-            description += " 如果是视频，请根据画面主要内容做概括。"
-        return [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": description},
-                    {"type": "image_url", "image_url": {"url": media_url}},
-                ],
-            }
-        ]
+        # 根据媒体类型选择提示词
+        is_video = _is_probably_video(media_type, media_url)
+        description = PROMPT_VIDEO if is_video else PROMPT_IMAGE
+    
+        contents: List[Dict[str, Any]] = [{"type": "text", "text": description}]
+    
+        if is_video:
+            # 视频：尝试抽帧并发送多张关键帧；否则回退为单帧/封面
+            frames = _sample_video_frames_to_files(media_url, VIDEO_FRAME_COUNT)
+            if frames:
+                contents.insert(1, {"type": "text", "text": "下面是该视频按顺序抽取的关键帧，请综合所有帧进行客观描述。"})
+                total_bytes = 0
+                used = 0
+                for fp in frames:
+                    data_url, raw_len = _file_to_data_url(fp)
+                    if total_bytes + raw_len > MAX_TOTAL_IMAGE_BYTES:
+                        break
+                    contents.append({"type": "image_url", "image_url": {"url": data_url}})
+                    total_bytes += raw_len
+                    used += 1
+                if used == 0:
+                    data_url, _ = _file_to_data_url(frames[0])
+                    contents.append({"type": "image_url", "image_url": {"url": data_url}})
+            else:
+                contents.insert(1, {"type": "text", "text": "抽帧未启用或失败，以下为视频封面/单帧，请给出概括性描述。"})
+                contents.append({"type": "image_url", "image_url": {"url": media_url}})
+        else:
+            # 图片：单张输入
+            contents.append({"type": "image_url", "image_url": {"url": media_url}})
+    
+        return [{"role": "user", "content": contents}]
+
 
     def _call_glm(self, fragment_id: str, media_url: str, media_type: str) -> Optional[Dict[str, Any]]:
         messages = self._build_messages(media_url, media_type)
@@ -403,7 +499,7 @@ class MultimodalPreprocessingService:
         channel.basic_consume(queue=FRAGMENT_QUEUE_NAME, on_message_callback=self._handle, auto_ack=False)
 
         log.info(
-            "多模态预处理服务已启动 queue=%s exchange=%s rk=%s",  # noqa: G004
+            "多模态预处理服务已启动 queue=%s exchange=%s rk=%s",
             FRAGMENT_QUEUE_NAME,
             FRAGMENT_EXCHANGE,
             FRAGMENT_ROUTING_KEY,

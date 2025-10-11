@@ -3,7 +3,7 @@
 # 用法：bash push_to_github_dev.sh
 
 # === 配置 ===
-REPO_URL="https://github.com/ZZUZSL1024/Y.git"  # 改成你的仓库地址
+REPO_URL="https://github.com/ZZUZSL1024/X.git"  # 改成你的仓库地址
 BRANCH_NAME="new_feature"
 
 echo "=== 初始化 Git（如果还没初始化） ==="
