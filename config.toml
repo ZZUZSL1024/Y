@@ -5,7 +5,7 @@ rabbitmq_pass = "bixing2025"
 queue_name = "gpu.ai.server.events.queue"
 fragment_queue_name = "fragment.preprocessing.queue"
 fragment_exchange = "user.behavior.events.exchange"
-fragment_routing_key = "user.change.fragment"
+fragment_routing_key = "fragment.llm.analysis"
 fragment_result_exchange = "ai.processing.results.exchange"
 fragment_result_routing_key = "fragment.preprocessing.completed"
 fragment_index = "user_fragments"
@@ -17,6 +17,10 @@ multimodal_glm_timeout = 60.0
 api_base_url = "http://test-app.bixing.com.cn"
 api_token = ""
 
+moderation_save_blocked_media = true
+moderation_quarantine_dir = "/root/autodl-tmp/Bixing_test/Bixing_MQ/1"
+moderation_quarantine_max_bytes = 10485760  # 10MB
+
 model_dir = "/root/autodl-tmp/models"
 
 [elasticsearch]
@@ -24,3 +28,4 @@ url = "http://124.221.49.124:9201"
 user = "elastic"
 password = "Bixing@202505"
 user_profile_index = "user_profile"
+
