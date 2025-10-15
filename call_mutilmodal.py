@@ -53,11 +53,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("multimodal")
 
-# ---- 嵌入模型只加载一次 ----
-EMBED_MODEL = SentenceTransformer(
-    os.path.join(MODEL_DIR, "bge-base-zh-v1.5"),
-    device="cuda" if torch.cuda.is_available() else "cpu",
-)
+# ---- 嵌入模型懒加载（减少冷启动时延/显存占用）----
+def _get_embed_model():
+    if not hasattr(_get_embed_model, "_m"):
+        _get_embed_model._m = SentenceTransformer(
+            os.path.join(MODEL_DIR, "bge-base-zh-v1.5"),
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+    return _get_embed_model._m
 
 _GLM_CLIENT: Optional[GLMClient] = None
 
@@ -155,37 +158,78 @@ def _compose_caption_from_features(features: Optional[Dict]) -> Optional[str]:
         return tag_text.replace(" 标签：", "标签：")
     return None
 
+
+def _compose_caption_from_fragment_row(frag: Dict) -> Optional[str]:
+    """
+    兼容后端接口当前格式：从 fragments[] 行内提取 analysisText/tags 生成描述。
+    - description 来自 analysisText（或 analysis_text）
+    - tags 来自 tags 数组
+    """
+    if not isinstance(frag, dict):
+        return None
+    desc = frag.get("analysisText") or frag.get("analysis_text") or ""
+    tags = frag.get("tags") if isinstance(frag.get("tags"), (list, tuple)) else None
+    # 两者都没有就跳过
+    if not (isinstance(desc, str) and desc.strip()) and not tags:
+        return None
+    features = {"description": desc, "tags": tags}
+    return _compose_caption_from_features(features)
+
+
 def _captions_from_payload(user_data: dict) -> List[str]:
     """
-    从 API 载荷中读取多模态描述列表：
-    期望 user_data["multimodal_features_list"] 是一个列表，元素可为：
-      - 字符串：直接当作描述
-      - 字典：包含 description/tags 字段，复用 _compose_caption_from_features() 产出描述
+    优先读取（若后端已提供）：
+      - user_data["multimodal_features_list"] / "multimodalFeaturesList"
+    若没有，则回退到：
+      - user_data["fragments"][i] 的 analysisText/tags
+      - 或 fragments[i].multimodal_features（兼容将来可能的形态）
     """
     if not isinstance(user_data, dict):
         return []
-    lst = (
-        user_data.get("multimodal_features_list")
-        or user_data.get("multimodalFeaturesList")  # 兼容大小写/驼峰
-        or []
-    )
-    if not isinstance(lst, list):
-        log.warning("multimodal_features_list 非列表，已忽略；type=%s", type(lst).__name__)
-        return []
 
     captions: List[str] = []
-    for item in lst:
-        cap = None
-        if isinstance(item, str):
-            cap = item.strip()
-        elif isinstance(item, dict):
-            cap = _compose_caption_from_features(item)
-        if cap:
-            captions.append(cap)
+
+    # 1) 扁平列表：multimodal_features_list / multimodalFeaturesList
+    lst = (
+        user_data.get("multimodal_features_list")
+        or user_data.get("multimodalFeaturesList")
+        or []
+    )
+    def _from_obj(obj: Dict) -> Optional[str]:
+        if not isinstance(obj, dict):
+            return None
+        features = obj.get("multimodal_features") if "multimodal_features" in obj else obj
+        return _compose_caption_from_features(features)
+    if isinstance(lst, list) and lst:
+        for item in lst:
+            if isinstance(item, str):
+                t = item.strip()
+                if t:
+                    captions.append(t)
+            elif isinstance(item, dict):
+                cap = _from_obj(item)
+                if cap:
+                    captions.append(cap)
+
+    # 2) 回退：从 fragments[] 提取 analysisText/tags 或 multimodal_features
+    if not captions:
+        frags = user_data.get("fragments") or []
+        if isinstance(frags, list):
+            for frag in frags:
+                if not isinstance(frag, dict):
+                    continue
+                if isinstance(frag.get("multimodal_features"), dict):
+                    cap = _compose_caption_from_features(frag["multimodal_features"])
+                else:
+                    cap = _compose_caption_from_fragment_row(frag)
+                if cap:
+                    captions.append(cap)
+
     return captions
 
 
 def _build_fragment_query(user_id: str) -> Dict:
+    # 已不再使用，保留占位（避免外部引用失败）
     fields = []
     if FRAGMENT_USER_FIELD:
         fields.append(FRAGMENT_USER_FIELD)
@@ -229,43 +273,8 @@ def _build_fragment_query(user_id: str) -> Dict:
 
 
 def fetch_user_fragment_descriptions(es, user_id: str, limit: int = MAX_CAPTION_IMAGES) -> List[str]:
-    if not user_id:
-        return []
-    index = FRAGMENT_INDEX
-    if not index:
-        log.warning("未配置碎片索引，无法读取多模态描述 userId=%s", user_id)
-        return []
-
-    query = _build_fragment_query(user_id)
-    source_fields = [
-        FRAGMENT_MULTIMODAL_FIELD,
-        f"{FRAGMENT_MULTIMODAL_FIELD}.description",
-        f"{FRAGMENT_MULTIMODAL_FIELD}.tags",
-        "fragment",
-    ]
-    size = limit if limit and limit > 0 else 100
-
-    try:
-        resp = es.search(index=index, query=query, source=source_fields, size=size)
-    except TypeError:
-        body = {"query": query, "_source": source_fields, "size": size}
-        resp = es.search(index=index, body=body)
-    except Exception as exc:
-        log.exception("查询碎片多模态描述失败 userId=%s err=%s", user_id, exc)
-        return []
-
-    hits = (resp.get("hits") or {}).get("hits") or []
-    captions: List[str] = []
-    for hit in hits:
-        source = hit.get("_source") or {}
-        caption = _compose_caption_from_features(source.get(FRAGMENT_MULTIMODAL_FIELD))
-        if not caption and isinstance(source.get("fragment"), dict):
-            caption = _compose_caption_from_features(
-                source["fragment"].get(FRAGMENT_MULTIMODAL_FIELD)
-            )
-        if caption:
-            captions.append(caption)
-    return captions
+    log.warning("fetch_user_fragment_descriptions() 已废弃：改为从接口载荷读取（multimodal_features_list 或 fragments[].analysisText/tags）。")
+    return []
 
 
 def call_glm4(user_id: str, texts: str, captions: List[str]) -> Dict[str, str]:
@@ -360,6 +369,8 @@ def multimodal_analyze_and_save(user_data: dict) -> bool:
     captions = _normalize_captions(raw_captions)
     t_caption = (time.time() - t1) * 1000
     log.info("从 API 载荷获取到 %d/%d 条图片描述 userId=%s", len(raw_captions), len(captions), user_id)
+    if not raw_captions:
+        log.warning("接口载荷未提供多模态描述（multimodal_features_list 或 fragments[].analysisText/tags），将仅基于文本画像 userId=%s", user_id)
 
     # ③ 调 GLM 生成画像
     t2 = time.time()
@@ -392,7 +403,7 @@ def multimodal_analyze_and_save(user_data: dict) -> bool:
 
     t3 = time.time()
     try:
-        embedding = EMBED_MODEL.encode(embed_text, normalize_embeddings=True).tolist()
+        embedding = _get_embed_model().encode(embed_text, normalize_embeddings=True).tolist()
     except Exception as exc:
         log.exception("Embedding 失败，降级为空向量: %s", exc)
         embedding = []
@@ -435,4 +446,3 @@ def multimodal_analyze_and_save(user_data: dict) -> bool:
     except Exception as exc:
         log.exception("写入 ES 失败 userId=%s err=%s", user_id, exc)
         return False
-
