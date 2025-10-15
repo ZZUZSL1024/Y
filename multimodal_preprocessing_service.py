@@ -9,18 +9,25 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import httpx
 import pika
 from PIL import Image
+
+try:  # Whisper 可能在部署环境中不存在
+    import whisper
+except Exception:  # noqa: BLE001
+    whisper = None
 
 # ========= 你的配置模块 =========
 from .config import config
@@ -55,6 +62,15 @@ PROMPT_VIDEO = r"""
   "tags": ["稳定元素与关键动作的名词/动名词，如：'室内办公','人群走动','镜头切换','特写','低照度'"]
 }
 """.strip()
+PROMPT_AUDIO = r"""
+你是一名音频内容分析助手。下面会提供音频的文字转写结果，请基于转写文本客观总结音频中包含的关键信息。
+返回 JSON，必须只包含 "description" 与 "tags" 两个键：
+
+{
+  "description": "按照事实、时间顺序和说话人要点进行总结，强调可验证信息，避免主观臆测。",
+  "tags": ["列出 3-8 个关键词，突出事件、人物、地点或情绪"]
+}
+""".strip()
 
 
 # -----------------------------------------------------------------------------
@@ -69,13 +85,17 @@ class QwenClient:
         self.default_vl_model = default_vl_model or "qwen-vl-max"
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
 
-    def chat_multimodal(self, messages: List[Dict[str, Any]], model: Optional[str] = None,
-                        response_format: Optional[Dict[str, Any]] = None) -> str:
+    def chat_multimodal(
+        self,
+        messages: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, Any]:
         req = {"model": model or self.default_vl_model, "messages": messages}
         if response_format:
             req["extra_body"] = {"response_format": response_format}
         resp = self.client.chat.completions.create(**req)
-        return (resp.choices[0].message.content or "").strip()
+        return (resp.choices[0].message.content or "").strip(), resp
 
 
 # -----------------------------------------------------------------------------
@@ -100,12 +120,24 @@ IMAGE_MAX_PIXELS = int(config.get("image_max_pixels", 1280 * 720))          # �
 IMAGE_MAX_BYTES = int(config.get("image_max_bytes", 2 * 1024 * 1024))       # 单张图片输出 dataURL 前原始字节上限（2MB）
 IMAGE_JPEG_QUALITY_START = int(config.get("image_jpeg_quality_start", 90))  # 初始 JPEG 质量
 IMAGE_JPEG_QUALITY_MIN = int(config.get("image_jpeg_quality_min", 60))      # 最低 JPEG 质量
+IMAGE_DOWNLOAD_MAX_BYTES = int(config.get("image_download_max_bytes", 8 * 1024 * 1024))
+ALLOWED_IMAGE_CONTENT_TYPES = {
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+}
 
 # 视频抽帧（本地 -> data URL）
 VIDEO_FRAME_COUNT = int(config.get("video_frame_count", 5))
 VIDEO_MAX_PIXELS = int(config.get("video_max_pixels", 1280 * 720))
 VIDEO_EXTS = set((config.get("video_exts") or ".mp4,.mov,.m4v,.webm,.avi,.mkv").lower().split(","))
 MAX_TOTAL_IMAGE_BYTES = int(config.get("video_max_total_image_bytes", 6 * 1024 * 1024))  # 多帧总上限
+VIDEO_RW_TIMEOUT_US = int(config.get("video_rw_timeout_us", 10_000_000))
+
+AUDIO_EXTS = set((config.get("audio_exts") or ".mp3,.wav,.m4a,.aac,.flac,.ogg,.opus").lower().split(","))
+WHISPER_MODEL_NAME = str(config.get("whisper_model_name", "base"))
 
 # RabbitMQ
 RABBITMQ_HOST = config["rabbitmq_host"]
@@ -116,6 +148,11 @@ FRAGMENT_ROUTING_KEY = config.get("fragment_routing_key", "user.change.fragment"
 FRAGMENT_EXCHANGE = config.get("fragment_exchange", "user.behavior.events.exchange")
 FRAGMENT_RESULT_EXCHANGE = config.get("fragment_result_exchange", "ai.processing.results.exchange")
 FRAGMENT_RESULT_ROUTING_KEY = config.get("fragment_result_routing_key", "fragment.preprocessing.completed")
+FAILURE_EXCHANGE = config.get("failure_exchange", "ai.processing.failures")
+FAILURE_ROUTING_KEY = config.get("failure_routing_key", "fragment.preprocessing.failed")
+ON_PUBLISH_FAIL = str(config.get("on_publish_fail", "compensate")).strip().lower()
+if ON_PUBLISH_FAIL not in {"requeue", "compensate"}:
+    ON_PUBLISH_FAIL = "compensate"
 
 RESULT_STATUS_SUCCESS = "success"
 RESULT_STATUS_FAILURE = "failure"
@@ -138,6 +175,13 @@ log = logging.getLogger("fragment-preprocessor")
 # -----------------------------------------------------------------------------
 # 工具函数
 # -----------------------------------------------------------------------------
+def log_event(event: str, **fields: Any) -> None:
+    try:
+        payload = json.dumps(fields, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        payload = json.dumps({"fallback": str(fields)}, ensure_ascii=False)
+    log.info("event=%s %s", event, payload)
+
 def conn_name(role: str) -> str:
     return f"{PROJECT_NAME}-{role}@{CLIENT_INFO}-{os.getpid()}"
 
@@ -156,12 +200,36 @@ def _ensure_list(value: Any) -> List[str]:
         return [part.strip() for part in re.split(r"[,、|]", text) if part.strip()]
     return [text]
 
+def _normalize_media_type(media_type: Optional[str]) -> Optional[str]:
+    if not media_type:
+        return None
+    value = str(media_type).strip().lower()
+    if value in {"video"}:
+        return "video"
+    if value in {"image", "picture", "photo", "img", "gif"}:
+        return "picture"
+    return None
+
 def _is_probably_video(media_type: Optional[str], media_url: str) -> bool:
-    if media_type and "video" in media_type.lower():
+    normalized = _normalize_media_type(media_type)
+    if normalized == "video":
+        return True
+    if normalized == "picture":
+        return False
+    try:
+        ext = (os.path.splitext(urlparse(media_url).path)[1] or "").lower()
+        if ext in VIDEO_EXTS:
+            return True
+    except Exception:
+        return False
+    return False
+
+def _is_probably_audio(media_type: Optional[str], media_url: str) -> bool:
+    if media_type and "audio" in str(media_type).lower():
         return True
     try:
         ext = (os.path.splitext(urlparse(media_url).path)[1] or "").lower()
-        return ext in VIDEO_EXTS
+        return ext in AUDIO_EXTS
     except Exception:
         return False
 
@@ -198,16 +266,49 @@ def _guess_ext_from_headers(ct: Optional[str], url: str) -> str:
     ext = os.path.splitext(path)[1].lower()
     return ext if ext else ".bin"
 
-def _download_bytes(url: str, timeout: float = 10.0) -> Tuple[Optional[bytes], Optional[str]]:
-    try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            return resp.content, resp.headers.get("Content-Type")
-    except Exception as e:
-        log.warning("下载失败 url=%s err=%s", url, e)
-        return None, None
 
+def _retryable(exc: Exception) -> bool:
+    message = str(exc).lower()
+    retry_keywords = [
+        "rate_limit",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "server error",
+        " 5xx",
+        "temporarily unavailable",
+        "bad gateway",
+        "service unavailable",
+    ]
+    if any(keyword in message for keyword in retry_keywords):
+        return True
+    if getattr(exc, "status_code", None) in {429, 500, 502, 503, 504}:
+        return True
+    err = getattr(exc, "error", None)
+    code = getattr(err, "code", None)
+    if code and str(code).lower() in {"rate_limit", "server_error"}:
+        return True
+    if "invalid_parameter_error" in message or "data_inspection_failed" in message:
+        return False
+    return False
+
+
+def call_with_retry(fn, *, max_tries: int = 3, base_delay: float = 0.5):
+    attempt = 0
+    last_exc: Optional[Exception] = None
+    while attempt < max_tries:
+        attempt += 1
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt >= max_tries or not _retryable(exc):
+                raise
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, base_delay)
+            log_event("retry_wait", attempt=attempt, delay=round(delay, 3), error=str(exc))
+            time.sleep(delay)
+    if last_exc:
+        raise last_exc
 def _image_bytes_to_jpeg(data: bytes, max_pixels: int = IMAGE_MAX_PIXELS,
                          max_bytes: int = IMAGE_MAX_BYTES) -> Optional[bytes]:
     """
@@ -229,9 +330,7 @@ def _image_bytes_to_jpeg(data: bytes, max_pixels: int = IMAGE_MAX_PIXELS,
         pass
 
     # 转 RGB
-    if im.mode not in ("RGB", "L"):
-        im = im.convert("RGB")
-    elif im.mode == "L":
+    if im.mode != "RGB":
         im = im.convert("RGB")
 
     # 降分辨率
@@ -261,38 +360,61 @@ def _image_bytes_to_jpeg(data: bytes, max_pixels: int = IMAGE_MAX_PIXELS,
 def _bytes_to_data_url(b: bytes, mime: str = "image/jpeg") -> str:
     return f"data:{mime};base64,{base64.b64encode(b).decode('ascii')}"
 
-def _image_url_to_data_url(media_url: str) -> Tuple[Optional[str], Optional[bytes]]:
-    raw, ct = _download_bytes(media_url)
-    if not raw:
-        return None, None
-    jpeg = _image_bytes_to_jpeg(raw)
-    if not jpeg:
-        return None, None
-    return _bytes_to_data_url(jpeg, "image/jpeg"), jpeg
-
 
 def _file_to_data_url(fp: str) -> Tuple[str, int]:
     with open(fp, "rb") as f:
         raw = f.read()
     return _bytes_to_data_url(raw, "image/jpeg"), len(raw)
 
-def _sample_video_frames_to_files(media_url: str, num_frames: int = VIDEO_FRAME_COUNT) -> List[str]:
+def _sample_video_frames_to_files(media_url: str, num_frames: int = VIDEO_FRAME_COUNT) -> Tuple[Optional[str], List[str]]:
     if not _has_ffmpeg():
-        return []
+        log_event("ffmpeg_missing", media_url=media_url)
+        return None, []
     tmpdir = tempfile.mkdtemp(prefix="vidframes_")
     out_pattern = os.path.join(tmpdir, "frame_%03d.jpg")
     vf = (
         f"scale='if(gt(iw*ih,{VIDEO_MAX_PIXELS}),iw*sqrt({VIDEO_MAX_PIXELS}/(iw*ih)),iw)':"
         f"'if(gt(iw*ih,{VIDEO_MAX_PIXELS}),ih*sqrt({VIDEO_MAX_PIXELS}/(iw*ih)),ih)',fps=1"
     )
-    cmd = ["ffmpeg", "-y", "-i", media_url, "-vf", vf, "-vsync", "vfr", out_pattern]
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-threads",
+        "1",
+        "-v",
+        "error",
+        "-rw_timeout",
+        str(VIDEO_RW_TIMEOUT_US),
+        "-i",
+        media_url,
+        "-vf",
+        vf,
+        "-vsync",
+        "vfr",
+        out_pattern,
+    ]
+    start = time.time()
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-    except Exception as e:
-        log.warning("ffmpeg 抽帧失败：%s", e)
-        return []
-    frames = sorted([os.path.join(tmpdir, f) for f in os.listdir(tmpdir) if f.lower().endswith(".jpg")])
-    return frames[: max(1, num_frames)] if frames else []
+        cost_ms = (time.time() - start) * 1000
+        frames = sorted([os.path.join(tmpdir, f) for f in os.listdir(tmpdir) if f.lower().endswith(".jpg")])
+        if not frames:
+            log_event("video_frame_extraction_empty", media_url=media_url, elapsed_ms=round(cost_ms, 2))
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return None, []
+        limited = frames[: max(1, num_frames)]
+        log_event(
+            "video_frame_extraction",
+            media_url=media_url,
+            elapsed_ms=round(cost_ms, 2),
+            frame_count=len(limited),
+            extracted=len(frames),
+        )
+        return tmpdir, limited
+    except Exception as e:  # noqa: BLE001
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        log_event("video_frame_extraction_failed", media_url=media_url, error=str(e))
+        return None, []
 
 def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     if not text:
@@ -344,79 +466,8 @@ def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
                         return None
     return None
 
-def _save_quarantine(
-    media_url: str,
-    fragment_id: str,
-    err_code: str,
-    request_id: Optional[str],
-    prepared_bytes: Optional[bytes] = None,   # 新增：可选的已重编码JPEG
-) -> Optional[str]:
-    if not MODERATION_SAVE_BLOCKED_MEDIA:
-        return None
-    os.makedirs(MODERATION_QUARANTINE_DIR, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    rid = _safe_comp(request_id or "no_reqid")
-    fid = _safe_comp(fragment_id or "no_fid")
-
-    # 1. 保存原图（直链下载）
-    media_path = None
-    total = 0
-    try:
-        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
-            with client.stream("GET", media_url) as resp:
-                resp.raise_for_status()
-                ext = _guess_ext_from_headers(resp.headers.get("Content-Type"), media_url)
-                media_name = f"{ts}_fid{fid}_{err_code}_{rid}_orig{ext}"
-                media_path = os.path.join(MODERATION_QUARANTINE_DIR, media_name)
-                with open(media_path, "wb") as f:
-                    for chunk in resp.iter_bytes():
-                        if not chunk:
-                            continue
-                        total += len(chunk)
-                        if total > MODERATION_QUARANTINE_MAX_BYTES:
-                            f.write(chunk[: MODERATION_QUARANTINE_MAX_BYTES - (total - len(chunk))])
-                            break
-                        f.write(chunk)
-    except Exception as exc:
-        log.error("保存隔离样本原图失败 url=%s err=%s", media_url, exc)
-
-    # 2. 保存已重编码 JPEG（如果有）
-    prepared_path = None
-    if prepared_bytes:
-        try:
-            prepared_name = f"{ts}_fid{fid}_{err_code}_{rid}_prepared.jpg"
-            prepared_path = os.path.join(MODERATION_QUARANTINE_DIR, prepared_name)
-            with open(prepared_path, "wb") as pf:
-                pf.write(prepared_bytes[:MODERATION_QUARANTINE_MAX_BYTES])
-        except Exception as exc:
-            log.error("保存隔离样本重编码JPEG失败 url=%s err=%s", media_url, exc)
-
-    # 3. 写 meta
-    try:
-        meta = {
-            "fragment_id": fragment_id,
-            "request_id": request_id,
-            "error_code": err_code,
-            "url": media_url,
-            "saved_at": _now_iso(),
-            "orig_path": media_path,
-            "prepared_path": prepared_path,
-            "size_bytes_capped": min(total, MODERATION_QUARANTINE_MAX_BYTES) if total else None,
-        }
-        meta_name = f"{ts}_fid{fid}_{err_code}_{rid}_meta.json"
-        meta_path = os.path.join(MODERATION_QUARANTINE_DIR, meta_name)
-        with open(meta_path, "w", encoding="utf-8") as mf:
-            json.dump(meta, mf, ensure_ascii=False, indent=2)
-        log.info("已保存隔离样本 meta=%s", meta_path)
-    except Exception as exc:
-        log.error("保存隔离样本 meta 失败 url=%s err=%s", media_url, exc)
-
-    return media_path or prepared_path
-
-
-
 MEDIA_URL_FIELDS = ["mediaUrl", "sourceUrl", "url", "coverUrl", "thumbnailUrl"]
-MEDIA_TYPE_FIELDS = ["mediaType", "type", "fragmentType", "category"]
+MEDIA_TYPE_FIELDS = ["mediaType", "fragmentType", "category", "type"]
 
 
 # -----------------------------------------------------------------------------
@@ -429,6 +480,264 @@ class MultimodalPreprocessingService:
             base_url=QWEN_BASE_URL,
             default_vl_model=QWEN_VL_MODEL,
         )
+        self.http = httpx.Client(timeout=10.0, follow_redirects=True)
+        self._whisper_model = None
+
+    def _download_bytes_with(
+        self,
+        url: str,
+        max_bytes: int = IMAGE_DOWNLOAD_MAX_BYTES,
+        allowed_types: Optional[Set[str]] = None,
+    ) -> Tuple[Optional[bytes], Optional[str]]:
+        try:
+            with self.http.stream("GET", url) as resp:
+                resp.raise_for_status()
+                content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                if allowed_types:
+                    if content_type:
+                        if content_type not in allowed_types:
+                            log_event(
+                                "download_disallowed_type",
+                                url=url,
+                                content_type=content_type,
+                                allowed=list(allowed_types),
+                            )
+                            return None, None
+                    else:
+                        guessed, _ = mimetypes.guess_type(url)
+                        if guessed and guessed.lower() not in allowed_types:
+                            log_event(
+                                "download_guess_disallowed",
+                                url=url,
+                                guessed=guessed,
+                                allowed=list(allowed_types),
+                            )
+                            return None, None
+                data = bytearray()
+                for chunk in resp.iter_bytes():
+                    if not chunk:
+                        continue
+                    data.extend(chunk)
+                    if len(data) > max_bytes:
+                        log_event(
+                            "download_exceeds_limit",
+                            url=url,
+                            limit=max_bytes,
+                            received=len(data),
+                        )
+                        return None, None
+                log_event(
+                    "download_completed",
+                    url=url,
+                    bytes=len(data),
+                    content_type=content_type or None,
+                )
+                return bytes(data), content_type or None
+        except Exception as exc:  # noqa: BLE001
+            log_event("download_failed", url=url, error=str(exc))
+            return None, None
+
+    def _image_url_to_data_url(self, media_url: str) -> Tuple[Optional[str], Optional[bytes]]:
+        raw, _ = self._download_bytes_with(
+            media_url,
+            max_bytes=IMAGE_DOWNLOAD_MAX_BYTES,
+            allowed_types=ALLOWED_IMAGE_CONTENT_TYPES,
+        )
+        if not raw:
+            return None, None
+        jpeg = _image_bytes_to_jpeg(raw)
+        if not jpeg:
+            return None, None
+        return _bytes_to_data_url(jpeg, "image/jpeg"), jpeg
+
+    def _ensure_whisper_model(self):
+        if whisper is None:
+            return None
+        if self._whisper_model is not None:
+            return self._whisper_model
+        try:
+            self._whisper_model = whisper.load_model(WHISPER_MODEL_NAME)
+            log_event("whisper_model_loaded", model=WHISPER_MODEL_NAME)
+        except Exception as exc:  # noqa: BLE001
+            log_event("whisper_model_load_failed", model=WHISPER_MODEL_NAME, error=str(exc))
+            self._whisper_model = None
+        return self._whisper_model
+
+    def _extract_audio_track(self, media_url: str) -> Tuple[Optional[str], Optional[str]]:
+        if not _has_ffmpeg():
+            log_event("ffmpeg_missing_audio", media_url=media_url)
+            return None, None
+        tmpdir = tempfile.mkdtemp(prefix="audio_extract_")
+        out_path = os.path.join(tmpdir, "audio.wav")
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-threads",
+            "1",
+            "-v",
+            "error",
+            "-rw_timeout",
+            str(VIDEO_RW_TIMEOUT_US),
+            "-i",
+            media_url,
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            out_path,
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+            log_event("audio_extracted", media_url=media_url, path=out_path)
+            return tmpdir, out_path
+        except Exception as exc:  # noqa: BLE001
+            log_event("audio_extract_failed", media_url=media_url, error=str(exc))
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return None, None
+
+    def _transcribe_audio(self, media_url: str) -> Optional[str]:
+        model = self._ensure_whisper_model()
+        if model is None:
+            log_event("audio_transcribe_skipped", media_url=media_url, reason="whisper_unavailable")
+            return None
+        tmpdir, audio_path = self._extract_audio_track(media_url)
+        if not audio_path:
+            return None
+        try:
+            result = model.transcribe(audio_path)
+            text = (result or {}).get("text") or ""
+            cleaned = text.strip()
+            log_event(
+                "audio_transcribed",
+                media_url=media_url,
+                has_text=bool(cleaned),
+            )
+            return cleaned or None
+        except Exception as exc:  # noqa: BLE001
+            log_event("audio_transcribe_failed", media_url=media_url, error=str(exc))
+            return None
+        finally:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _save_quarantine(
+        self,
+        media_url: str,
+        fragment_id: str,
+        err_code: str,
+        request_id: Optional[str],
+        prepared_bytes: Optional[bytes] = None,
+    ) -> Optional[str]:
+        if not MODERATION_SAVE_BLOCKED_MEDIA:
+            return None
+        os.makedirs(MODERATION_QUARANTINE_DIR, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rid = _safe_comp(request_id or "no_reqid")
+        fid = _safe_comp(fragment_id or "no_fid")
+
+        media_path = None
+        raw_bytes, ct = self._download_bytes_with(
+            media_url,
+            max_bytes=MODERATION_QUARANTINE_MAX_BYTES,
+            allowed_types=ALLOWED_IMAGE_CONTENT_TYPES,
+        )
+        raw_size = len(raw_bytes) if raw_bytes else None
+        if raw_bytes:
+            ext = _guess_ext_from_headers(ct, media_url)
+            media_name = f"{ts}_fid{fid}_{err_code}_{rid}_orig{ext}"
+            media_path = os.path.join(MODERATION_QUARANTINE_DIR, media_name)
+            try:
+                with open(media_path, "wb") as f:
+                    f.write(raw_bytes[:MODERATION_QUARANTINE_MAX_BYTES])
+            except Exception as exc:  # noqa: BLE001
+                log_event("quarantine_save_failed", media_url=media_url, error=str(exc))
+                media_path = None
+
+        prepared_path = None
+        if prepared_bytes:
+            try:
+                prepared_name = f"{ts}_fid{fid}_{err_code}_{rid}_prepared.jpg"
+                prepared_path = os.path.join(MODERATION_QUARANTINE_DIR, prepared_name)
+                with open(prepared_path, "wb") as pf:
+                    pf.write(prepared_bytes[:MODERATION_QUARANTINE_MAX_BYTES])
+            except Exception as exc:  # noqa: BLE001
+                log_event("quarantine_prepared_save_failed", media_url=media_url, error=str(exc))
+
+        try:
+            meta = {
+                "fragment_id": fragment_id,
+                "request_id": request_id,
+                "error_code": err_code,
+                "url": media_url,
+                "saved_at": _now_iso(),
+                "orig_path": media_path,
+                "prepared_path": prepared_path,
+                "content_type": ct,
+                "size_bytes_capped": raw_size,
+            }
+            meta_name = f"{ts}_fid{fid}_{err_code}_{rid}_meta.json"
+            meta_path = os.path.join(MODERATION_QUARANTINE_DIR, meta_name)
+            with open(meta_path, "w", encoding="utf-8") as mf:
+                json.dump(meta, mf, ensure_ascii=False, indent=2)
+            log_event("quarantine_meta_saved", fragment_id=fragment_id, meta_path=meta_path)
+        except Exception as exc:  # noqa: BLE001
+            log_event("quarantine_meta_failed", media_url=media_url, error=str(exc))
+
+        return media_path or prepared_path
+
+    def _publish_failure_compensation(
+        self,
+        channel: pika.channel.Channel,
+        *,
+        original_message: Dict[str, Any],
+        error_code: str,
+        error_message: str,
+    ) -> bool:
+        fragment_id = (original_message.get("metadata") or {}).get("fragment_id")
+        trace_id = original_message.get("trace_id")
+        if not FAILURE_EXCHANGE or not FAILURE_ROUTING_KEY:
+            log_event(
+                "compensation_skipped",
+                fragment_id=fragment_id,
+                trace_id=trace_id,
+                reason="missing_config",
+            )
+            return False
+        payload = {
+            "status": RESULT_STATUS_FAILURE,
+            "trace_id": trace_id or "",
+            "metadata": original_message.get("metadata"),
+            "payload": original_message.get("payload"),
+            "error": {"code": error_code, "message": error_message},
+            "failed_at": _now_iso(),
+        }
+        try:
+            channel.basic_publish(
+                exchange=FAILURE_EXCHANGE,
+                routing_key=FAILURE_ROUTING_KEY,
+                body=json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"),
+                properties=pika.BasicProperties(delivery_mode=2),
+            )
+            log_event(
+                "compensation_published",
+                fragment_id=fragment_id,
+                trace_id=trace_id,
+                exchange=FAILURE_EXCHANGE,
+                routing_key=FAILURE_ROUTING_KEY,
+                error_code=error_code,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                "compensation_publish_failed",
+                fragment_id=fragment_id,
+                trace_id=trace_id,
+                error=str(exc),
+            )
+            return False
 
     # 解析消息
     def _extract_fragment(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -464,12 +773,24 @@ class MultimodalPreprocessingService:
                 media_url = url.strip()
                 break
 
-        media_type = None
+        media_type_value = None
         for field in MEDIA_TYPE_FIELDS:
             value = data.get(field) or payload.get(field)
             if isinstance(value, str) and value.strip():
-                media_type = value.strip().lower()
+                media_type_value = value.strip()
                 break
+
+        normalized_type = _normalize_media_type(media_type_value)
+        if not normalized_type and _is_probably_video(media_type_value, media_url):
+            normalized_type = "video"
+        if not normalized_type and _is_probably_audio(media_type_value, media_url):
+            normalized_type = "audio"
+        if normalized_type:
+            media_type = normalized_type
+        elif media_type_value:
+            media_type = media_type_value.strip().lower()
+        else:
+            media_type = "picture"
 
         trace_id = str(
             payload.get("trace_id")
@@ -491,40 +812,81 @@ class MultimodalPreprocessingService:
             "fragment_id": fragment_id,
             "user_id": user_id,
             "media_url": media_url,
-            "media_type": media_type or "picture",
+            "media_type": media_type,
             "trace_id": trace_id,
             "metadata": request_metadata,
         }
 
     # 构造消息（返回 messages, used_data_url, raw_image_url）
-    def _build_messages(self, media_url: str, media_type: str) -> Tuple[List[Dict[str, Any]], bool, Optional[str], Optional[bytes]]:
-        is_video = _is_probably_video(media_type, media_url)
-        description = PROMPT_VIDEO if is_video else PROMPT_IMAGE
-        contents: List[Dict[str, Any]] = [{"type": "text", "text": description}]
+    def _build_messages(
+        self,
+        media_url: str,
+        media_type: str,
+        request_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Dict[str, Any]], bool, Optional[str], Optional[bytes]]:
+        request_metadata = request_metadata or {}
+        is_audio = _is_probably_audio(media_type, media_url)
+        is_video = _is_probably_video(media_type, media_url) and not is_audio
+
         used_data_url = False
-        raw_image_url = None
+        raw_image_url: Optional[str] = None
         prepared_bytes: Optional[bytes] = None
-    
-        if is_video:
-            frames = _sample_video_frames_to_files(media_url, VIDEO_FRAME_COUNT)
-            if frames:
-                contents.insert(1, {"type": "text", "text": "下面是该视频按顺序抽取的关键帧，请综合所有帧进行客观描述。"})
-                total_bytes = 0
-                used = 0
-                for fp in frames:
-                    data_url, raw_len = _file_to_data_url(fp)
-                    if total_bytes + raw_len > MAX_TOTAL_IMAGE_BYTES:
-                        break
-                    contents.append({"type": "image_url", "image_url": {"url": data_url}})
-                    total_bytes += raw_len
-                    used += 1
-                if used == 0:
-                    data_url, _ = _file_to_data_url(frames[0])
-                    contents.append({"type": "image_url", "image_url": {"url": data_url}})
-                used_data_url = True
+
+        if is_audio:
+            contents: List[Dict[str, Any]] = [{"type": "text", "text": PROMPT_AUDIO}]
+            transcript = self._transcribe_audio(media_url)
+            if transcript:
+                contents.append({"type": "text", "text": f"音频转写内容：{transcript}"})
             else:
-                contents.insert(1, {"type": "text", "text": "抽帧未启用或失败，以下为视频封面/单帧，请给出概括性描述。"})
-                data_url, prep = _image_url_to_data_url(media_url)
+                contents.append({"type": "text", "text": "未能成功获取音频转写，请根据已知信息进行客观总结。"})
+            return [{"role": "user", "content": contents}], used_data_url, raw_image_url, prepared_bytes
+
+        description = PROMPT_VIDEO if is_video else PROMPT_IMAGE
+        contents = [{"type": "text", "text": description}]
+
+        audio_text = None
+        if is_video:
+            audio_text = self._transcribe_audio(media_url)
+
+        tmpdir = None
+        try:
+            if is_video:
+                tmpdir, frames = _sample_video_frames_to_files(media_url, VIDEO_FRAME_COUNT)
+                if frames:
+                    contents.append({"type": "text", "text": "下面是该视频按顺序抽取的关键帧，请综合所有帧进行客观描述。"})
+                    total_bytes = 0
+                    used = 0
+                    for fp in frames:
+                        data_url, raw_len = _file_to_data_url(fp)
+                        if total_bytes + raw_len > MAX_TOTAL_IMAGE_BYTES:
+                            break
+                        contents.append({"type": "image_url", "image_url": {"url": data_url}})
+                        total_bytes += raw_len
+                        used += 1
+                    if used == 0:
+                        data_url, _ = _file_to_data_url(frames[0])
+                        contents.append({"type": "image_url", "image_url": {"url": data_url}})
+                    used_data_url = True
+                else:
+                    cover_url = None
+                    for key in ("coverUrl", "thumbnailUrl", "snapshotPath", "coverImageUrl"):
+                        value = request_metadata.get(key)
+                        if isinstance(value, str) and value.strip():
+                            cover_url = value.strip()
+                            break
+                    if cover_url:
+                        data_url, prep = self._image_url_to_data_url(cover_url)
+                        if data_url:
+                            contents.append({"type": "image_url", "image_url": {"url": data_url}})
+                            used_data_url = True
+                            prepared_bytes = prep
+                        else:
+                            contents.append({"type": "image_url", "image_url": {"url": cover_url}})
+                            raw_image_url = cover_url
+                    else:
+                        contents.append({"type": "text", "text": "无封面且抽帧失败，仅文本概括。"})
+            else:
+                data_url, prep = self._image_url_to_data_url(media_url)
                 if data_url:
                     contents.append({"type": "image_url", "image_url": {"url": data_url}})
                     used_data_url = True
@@ -532,16 +894,13 @@ class MultimodalPreprocessingService:
                 else:
                     contents.append({"type": "image_url", "image_url": {"url": media_url}})
                     raw_image_url = media_url
-        else:
-            data_url, prep = _image_url_to_data_url(media_url)
-            if data_url:
-                contents.append({"type": "image_url", "image_url": {"url": data_url}})
-                used_data_url = True
-                prepared_bytes = prep
-            else:
-                contents.append({"type": "image_url", "image_url": {"url": media_url}})
-                raw_image_url = media_url
-    
+        finally:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+        if audio_text:
+            contents.append({"type": "text", "text": f"视频音频文字转写：{audio_text}"})
+
         return [{"role": "user", "content": contents}], used_data_url, raw_image_url, prepared_bytes
 
     def _parse_openai_error(self, exc: Exception) -> Dict[str, Any]:
@@ -573,30 +932,53 @@ class MultimodalPreprocessingService:
                 pass
         return info
 
-    def _call_qwen(self, fragment_id: str, media_url: str, media_type: str) -> Optional[Dict[str, Any]]:
-        messages, used_data_url, raw_image_url, prepared_bytes = self._build_messages(media_url, media_type)
+    def _call_qwen(
+        self,
+        fragment_id: str,
+        media_url: str,
+        media_type: str,
+        request_metadata: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        messages, used_data_url, raw_image_url, prepared_bytes = self._build_messages(
+            media_url,
+            media_type,
+            request_metadata=request_metadata,
+        )
         start = time.time()
+        response_obj: Any = None
         try:
-            content = self.qwen.chat_multimodal(
-                messages=messages,
-                model=QWEN_VL_MODEL,
-                response_format={"type": "json_object"},
+            content, response_obj = call_with_retry(
+                lambda: self.qwen.chat_multimodal(
+                    messages=messages,
+                    model=QWEN_VL_MODEL,
+                    response_format={"type": "json_object"},
+                )
+            )
+            cost = (time.time() - start) * 1000
+            request_id = getattr(response_obj, "id", None) or getattr(response_obj, "request_id", None)
+            log_event(
+                "qwen_call_success",
+                fragment_id=fragment_id,
+                elapsed_ms=round(cost, 2),
+                request_id=request_id,
+                used_data_url=used_data_url,
             )
         except Exception as e:
             cost = (time.time() - start) * 1000
             info = self._parse_openai_error(e)
             err_obj = info.get("error") or {}
             err_code = err_obj.get("code") or ""
-            req_id = info.get("id") or info.get("request_id")
-    
-            log.error(
-                "Qwen 多模态接口异常 fragmentId=%s cost=%.1fms code=%s request_id=%s err=%s",
-                fragment_id, cost, err_code or None, req_id or None, info or {}
+            req_id = info.get("id") or info.get("request_id") or err_obj.get("request_id")
+            log_event(
+                "qwen_call_failed",
+                fragment_id=fragment_id,
+                elapsed_ms=round(cost, 2),
+                error_code=err_code or None,
+                request_id=req_id or None,
             )
-    
             # —— 安全审查拦截：落盘 + 可选兜底 ——
             if err_code == "data_inspection_failed":
-                _save_quarantine(media_url, fragment_id, err_code, req_id, prepared_bytes=prepared_bytes)
+                self._save_quarantine(media_url, fragment_id, err_code, req_id, prepared_bytes=prepared_bytes)
                 if MODERATION_FALLBACK_AS_SUCCESS:
                     return {
                         "description": MODERATION_PLACEHOLDER_DESC,
@@ -610,50 +992,59 @@ class MultimodalPreprocessingService:
     
             # —— 非法图片：若首轮不是 dataURL 且有直链，强制重编码重试；不论结果，先落盘出错样本 ——
             if err_code == "invalid_parameter_error" and (not used_data_url) and raw_image_url:
-                _save_quarantine(media_url, fragment_id, err_code, req_id, prepared_bytes=None)
-                forced_data_url, forced_bytes = _image_url_to_data_url(raw_image_url)
+                self._save_quarantine(media_url, fragment_id, err_code, req_id, prepared_bytes=None)
+                forced_data_url, forced_bytes = self._image_url_to_data_url(raw_image_url)
                 if forced_data_url:
                     retry_messages = [{"role": "user", "content": [
                         {"type": "text", "text": PROMPT_IMAGE if not _is_probably_video(media_type, media_url) else PROMPT_VIDEO},
                         {"type": "image_url", "image_url": {"url": forced_data_url}},
                     ]}]
                     try:
-                        content = self.qwen.chat_multimodal(
+                        content, response_obj = self.qwen.chat_multimodal(
                             messages=retry_messages,
                             model=QWEN_VL_MODEL,
                             response_format={"type": "json_object"},
+                        )
+                        log_event(
+                            "qwen_retry_success",
+                            fragment_id=fragment_id,
+                            request_id=getattr(response_obj, "id", None),
                         )
                     except Exception as e2:
                         info2 = self._parse_openai_error(e2)
                         err_code2 = (info2.get("error") or {}).get("code") or "invalid_parameter_error"
                         req_id2 = info2.get("id") or info2.get("request_id")
-                        _save_quarantine(media_url, fragment_id, err_code2, req_id2, prepared_bytes=forced_bytes)
+                        self._save_quarantine(media_url, fragment_id, err_code2, req_id2, prepared_bytes=forced_bytes)
                         return None
                 else:
-                    _save_quarantine(media_url, fragment_id, "invalid_image_format_download_failed", req_id, prepared_bytes=None)
+                    self._save_quarantine(media_url, fragment_id, "invalid_image_format_download_failed", req_id, prepared_bytes=None)
                     return None
             else:
                 # —— 其他所有错误：一律落盘（含原图与重编码）——
-                _save_quarantine(media_url, fragment_id, err_code or "call_failed", req_id, prepared_bytes=prepared_bytes)
+                self._save_quarantine(media_url, fragment_id, err_code or "call_failed", req_id, prepared_bytes=prepared_bytes)
                 return None
     
         # 正常解析
         if not content:
-            _save_quarantine(media_url, fragment_id, "empty_response", None, prepared_bytes=prepared_bytes)
-            log.error("Qwen 返回空结果 fragmentId=%s", fragment_id)
+            self._save_quarantine(media_url, fragment_id, "empty_response", None, prepared_bytes=prepared_bytes)
+            log_event("qwen_empty_response", fragment_id=fragment_id)
             return None
     
         data = extract_json_object(content)
         if not data:
-            _save_quarantine(media_url, fragment_id, "parse_json_failed", None, prepared_bytes=prepared_bytes)
-            log.error("Qwen 返回结果无法解析为 JSON fragmentId=%s content[:200]=%s", fragment_id, content[:200])
+            self._save_quarantine(media_url, fragment_id, "parse_json_failed", None, prepared_bytes=prepared_bytes)
+            log_event("qwen_parse_failed", fragment_id=fragment_id, preview=content[:200])
             return None
     
         description = (data.get("description") or data.get("caption") or "").strip()
         tags = _ensure_list(data.get("tags") or data.get("keywords"))
         if (not description) and tags:
             description = "、".join(tags[:5])
-    
+
+        request_id = getattr(response_obj, "id", None) or getattr(response_obj, "request_id", None)
+        if isinstance(data, dict) and request_id:
+            data.setdefault("request_id", request_id)
+
         return {
             "description": description,
             "tags": tags,
@@ -721,9 +1112,21 @@ class MultimodalPreprocessingService:
                 "已推送预处理结果 status=%s traceId=%s fragmentId=%s exchange=%s rk=%s",
                 message.get("status"), trace_id, fragment_id, FRAGMENT_RESULT_EXCHANGE, FRAGMENT_RESULT_ROUTING_KEY,
             )
+            log_event(
+                "result_published",
+                fragment_id=fragment_id,
+                trace_id=trace_id,
+                status=message.get("status"),
+            )
             return True
         except Exception as exc:
             log.exception("推送预处理结果失败 fragmentId=%s err=%s", fragment_id, exc)
+            log_event(
+                "result_publish_failed",
+                fragment_id=fragment_id,
+                trace_id=trace_id,
+                error=str(exc),
+            )
             return False
 
     # 消费处理
@@ -737,6 +1140,10 @@ class MultimodalPreprocessingService:
 
         items = payload if isinstance(payload, list) else [payload]
         success = True
+        success_ids: List[str] = []
+        failed_ids: List[str] = []
+        total_processed = 0
+
         for item in items:
             if not isinstance(item, dict):
                 log.warning("消息体非字典，跳过：%s", item)
@@ -749,11 +1156,12 @@ class MultimodalPreprocessingService:
             media_url = info["media_url"]
             media_type = info["media_type"]
             user_id = info["user_id"]
+            total_processed += 1
 
             features: Optional[Dict[str, Any]] = None
             error_info: Optional[Dict[str, Any]] = None
             try:
-                features = self._call_qwen(fragment_id, media_url, media_type)
+                features = self._call_qwen(fragment_id, media_url, media_type, info.get("metadata"))
                 if not features:
                     error_info = {"code": "NO_FEATURES", "message": "Qwen 未返回有效多模态特征"}
             except Exception as exc:  # noqa: BLE001
@@ -772,12 +1180,50 @@ class MultimodalPreprocessingService:
                 error=error_info,
             )
 
-            if message.get("status") != RESULT_STATUS_SUCCESS:
+            is_success = message.get("status") == RESULT_STATUS_SUCCESS
+            if is_success:
+                success_ids.append(fragment_id)
+            else:
+                failed_ids.append(fragment_id)
+                err_payload = message.get("error") or {}
+                self._publish_failure_compensation(
+                    channel,
+                    original_message=message,
+                    error_code=str(err_payload.get("code") or DEFAULT_ERROR_CODE),
+                    error_message=str(err_payload.get("message") or "多模态预处理失败"),
+                )
+
+            published = self._publish(channel, message)
+            if not published:
                 success = False
-            if not self._publish(channel, message):
-                success = False
+                if ON_PUBLISH_FAIL == "requeue":
+                    log_event("publish_failed_requeue", fragment_id=fragment_id, trace_id=info.get("trace_id"))
+                    channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                    return
+                failure_error = message.get("error") or {}
+                code = str(failure_error.get("code") or "PUBLISH_FAILED")
+                msg = str(failure_error.get("message") or "预处理结果发布失败")
+                if is_success:
+                    if fragment_id not in failed_ids:
+                        failed_ids.append(fragment_id)
+                    self._publish_failure_compensation(
+                        channel,
+                        original_message=message,
+                        error_code=code,
+                        error_message=msg,
+                    )
+            success = success and is_success and published
 
         channel.basic_ack(delivery_tag=method.delivery_tag)
+        log_event(
+            "message_batch_processed",
+            delivery_tag=method.delivery_tag,
+            total=total_processed,
+            success_count=len(success_ids),
+            failure_count=len(failed_ids),
+            success_ids=success_ids,
+            failure_ids=failed_ids,
+        )
         if success:
             log.info("消息处理完成 deliveryTag=%s", method.delivery_tag)
         else:
@@ -795,25 +1241,40 @@ class MultimodalPreprocessingService:
             retry_delay=2.0,
             client_properties={"connection_name": f"{PROJECT_NAME}-fragment-worker@{CLIENT_INFO}-{os.getpid()}"},
         )
-        connection = pika.BlockingConnection(params)
-        channel = connection.channel()
-
+        connection: Optional[pika.BlockingConnection] = None
+        channel: Optional[pika.channel.Channel] = None
         try:
-            channel.queue_declare(queue=FRAGMENT_QUEUE_NAME, durable=True, passive=True)
-        except pika.exceptions.ChannelClosedByBroker:
+            connection = pika.BlockingConnection(params)
             channel = connection.channel()
-            raise RuntimeError(f"Queue {FRAGMENT_QUEUE_NAME} not found. 请先在 RabbitMQ 创建该队列。")
 
-        channel.queue_bind(exchange=FRAGMENT_EXCHANGE, queue=FRAGMENT_QUEUE_NAME, routing_key=FRAGMENT_ROUTING_KEY)
-        channel.basic_qos(prefetch_count=1)
-        channel.basic_consume(queue=FRAGMENT_QUEUE_NAME, on_message_callback=self._handle, auto_ack=False)
+            try:
+                channel.queue_declare(queue=FRAGMENT_QUEUE_NAME, durable=True, passive=True)
+            except pika.exceptions.ChannelClosedByBroker:
+                channel = connection.channel()
+                raise RuntimeError(f"Queue {FRAGMENT_QUEUE_NAME} not found. 请先在 RabbitMQ 创建该队列。")
 
-        log.info(
-            "多模态预处理服务已启动 queue=%s exchange=%s rk=%s model=%s base_url=%s quarantine_dir=%s save_blocked=%s",
-            FRAGMENT_QUEUE_NAME, FRAGMENT_EXCHANGE, FRAGMENT_ROUTING_KEY,
-            QWEN_VL_MODEL, QWEN_BASE_URL, MODERATION_QUARANTINE_DIR, MODERATION_SAVE_BLOCKED_MEDIA,
-        )
-        channel.start_consuming()
+            channel.queue_bind(exchange=FRAGMENT_EXCHANGE, queue=FRAGMENT_QUEUE_NAME, routing_key=FRAGMENT_ROUTING_KEY)
+            channel.basic_qos(prefetch_count=1)
+            channel.basic_consume(queue=FRAGMENT_QUEUE_NAME, on_message_callback=self._handle, auto_ack=False)
+
+            log.info(
+                "多模态预处理服务已启动 queue=%s exchange=%s rk=%s model=%s base_url=%s quarantine_dir=%s save_blocked=%s",
+                FRAGMENT_QUEUE_NAME, FRAGMENT_EXCHANGE, FRAGMENT_ROUTING_KEY,
+                QWEN_VL_MODEL, QWEN_BASE_URL, MODERATION_QUARANTINE_DIR, MODERATION_SAVE_BLOCKED_MEDIA,
+            )
+            channel.start_consuming()
+        finally:
+            if channel is not None:
+                try:
+                    channel.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self.http.close()
 
 
 def start_multimodal_preprocessor() -> None:
